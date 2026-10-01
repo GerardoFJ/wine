@@ -25,6 +25,48 @@ extern "C" {
 
 typedef PVOID WINUSB_INTERFACE_HANDLE, *PWINUSB_INTERFACE_HANDLE;
 
+typedef enum _USBD_PIPE_TYPE
+{
+    UsbdPipeTypeControl,
+    UsbdPipeTypeIsochronous,
+    UsbdPipeTypeBulk,
+    UsbdPipeTypeInterrupt,
+} USBD_PIPE_TYPE;
+
+typedef struct _WINUSB_PIPE_INFORMATION
+{
+    USBD_PIPE_TYPE PipeType;
+    UCHAR  PipeId;
+    USHORT MaximumPacketSize;
+    UCHAR  Interval;
+} WINUSB_PIPE_INFORMATION, *PWINUSB_PIPE_INFORMATION;
+
+#include <pshpack1.h>
+typedef struct _USB_INTERFACE_DESCRIPTOR
+{
+    UCHAR bLength;
+    UCHAR bDescriptorType;
+    UCHAR bInterfaceNumber;
+    UCHAR bAlternateSetting;
+    UCHAR bNumEndpoints;
+    UCHAR bInterfaceClass;
+    UCHAR bInterfaceSubClass;
+    UCHAR bInterfaceProtocol;
+    UCHAR iInterface;
+} USB_INTERFACE_DESCRIPTOR, *PUSB_INTERFACE_DESCRIPTOR;
+#include <poppack.h>
+
+#include <pshpack1.h>
+typedef struct _WINUSB_SETUP_PACKET
+{
+    UCHAR  RequestType;
+    UCHAR  Request;
+    USHORT Value;
+    USHORT Index;
+    USHORT Length;
+} WINUSB_SETUP_PACKET, *PWINUSB_SETUP_PACKET;
+#include <poppack.h>
+
 BOOL WINAPI WinUsb_Free(WINUSB_INTERFACE_HANDLE);
 
 #ifdef __cplusplus

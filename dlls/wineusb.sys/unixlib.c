@@ -135,6 +135,7 @@ static void add_usb_device(libusb_device *libusb_device)
 
     usb_event.type = USB_EVENT_ADD_DEVICE;
     usb_event.u.added_device.device = unix_device;
+    usb_event.u.added_device.parent = NULL;
     usb_event.u.added_device.vendor = device_desc.idVendor;
     usb_event.u.added_device.product = device_desc.idProduct;
     usb_event.u.added_device.revision = device_desc.bcdDevice;
@@ -203,6 +204,7 @@ static void add_usb_device(libusb_device *libusb_device)
                 pthread_mutex_unlock(&device_mutex);
 
                 usb_event.u.added_device.device = unix_iface;
+                usb_event.u.added_device.parent = unix_device;
                 usb_event.u.added_device.class = iface_desc->bInterfaceClass;
                 usb_event.u.added_device.subclass = iface_desc->bInterfaceSubClass;
                 usb_event.u.added_device.protocol = iface_desc->bInterfaceProtocol;
@@ -358,6 +360,16 @@ static void LIBUSB_CALL transfer_cb(struct libusb_transfer *transfer)
                 struct _URB_CONTROL_DESCRIPTOR_REQUEST *req = &urb->UrbControlDescriptorRequest;
                 req->TransferBufferLength = transfer->actual_length;
                 memcpy(transfer_buffer, libusb_control_transfer_get_data(transfer), transfer->actual_length);
+                break;
+            }
+
+            case URB_FUNCTION_CONTROL_TRANSFER:
+            {
+                struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
+                req->TransferBufferLength = transfer->actual_length;
+                if ((req->SetupPacket[0] & LIBUSB_ENDPOINT_IN) && transfer_buffer)
+                    memcpy(transfer_buffer, libusb_control_transfer_get_data(transfer),
+                            transfer->actual_length);
                 break;
             }
 
@@ -540,6 +552,50 @@ static NTSTATUS usb_submit_urb(void *args)
             return STATUS_SUCCESS;
         }
 
+        case URB_FUNCTION_CONTROL_TRANSFER:
+        {
+            struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
+            struct transfer_ctx *transfer_ctx;
+            unsigned char *buffer;
+
+            if (!(transfer_ctx = calloc(1, sizeof(*transfer_ctx))))
+                return STATUS_NO_MEMORY;
+            transfer_ctx->irp = irp;
+            transfer_ctx->transfer_buffer = params->transfer_buffer;
+
+            if (!(transfer = libusb_alloc_transfer(0)))
+            {
+                free(transfer_ctx);
+                return STATUS_NO_MEMORY;
+            }
+            irp->Tail.Overlay.DriverContext[0] = transfer;
+
+            if (!(buffer = malloc(LIBUSB_CONTROL_SETUP_SIZE + req->TransferBufferLength)))
+            {
+                free(transfer_ctx);
+                libusb_free_transfer(transfer);
+                return STATUS_NO_MEMORY;
+            }
+
+            memcpy(buffer, req->SetupPacket, LIBUSB_CONTROL_SETUP_SIZE);
+            TRACE("control: %02x %02x %02x %02x %02x %02x %02x %02x, len %u\n",
+                    req->SetupPacket[0], req->SetupPacket[1], req->SetupPacket[2],
+                    req->SetupPacket[3], req->SetupPacket[4], req->SetupPacket[5],
+                    req->SetupPacket[6], req->SetupPacket[7],
+                    (unsigned int)req->TransferBufferLength);
+            if (!(req->SetupPacket[0] & LIBUSB_ENDPOINT_IN) && req->TransferBufferLength)
+                memcpy(buffer + LIBUSB_CONTROL_SETUP_SIZE, params->transfer_buffer,
+                        req->TransferBufferLength);
+
+            libusb_fill_control_transfer(transfer, handle, buffer, transfer_cb, transfer_ctx, 0);
+            transfer->flags = LIBUSB_TRANSFER_FREE_BUFFER | LIBUSB_TRANSFER_FREE_TRANSFER;
+            ret = libusb_submit_transfer(transfer);
+            if (ret < 0)
+                ERR("Failed to submit control transfer: %s\n", libusb_strerror(ret));
+
+            return STATUS_PENDING;
+        }
+
         case URB_FUNCTION_VENDOR_DEVICE:
         case URB_FUNCTION_VENDOR_INTERFACE:
         case URB_FUNCTION_VENDOR_ENDPOINT:
@@ -642,6 +698,66 @@ static NTSTATUS usb_destroy_device(void *args)
     return STATUS_SUCCESS;
 }
 
+/* Synchronously read a descriptor from a device. The hub PDO uses this to
+ * answer IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, which libusb issues
+ * while enumerating in order to cache configuration descriptors. */
+static NTSTATUS usb_get_descriptor(void *args)
+{
+    const struct usb_get_descriptor_params *params = args;
+    int ret;
+
+    ret = libusb_control_transfer(params->device->handle,
+            LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD | LIBUSB_RECIPIENT_DEVICE,
+            LIBUSB_REQUEST_GET_DESCRIPTOR, (params->type << 8) | params->index,
+            params->langid, params->buffer, params->size, 1000);
+    if (ret < 0)
+    {
+        WARN("Failed to get descriptor %#x index %#x: %s\n",
+                params->type, params->index, libusb_strerror(ret));
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    *params->ret_size = ret;
+    return STATUS_SUCCESS;
+}
+
+/* Claim an interface for the duration of a user-mode open.
+ *
+ * The Linux kernel may already have a driver bound to it -- cdc_acm owns both
+ * of the HaptX Airpack's CDC interfaces, for instance, which made every
+ * transfer fail immediately with LIBUSB_ERROR_IO. WinUSB semantics give the
+ * opener exclusive access to the interface, so detach the kernel driver;
+ * libusb reattaches it when the interface is released. */
+static NTSTATUS usb_claim_interface(void *args)
+{
+    const struct usb_claim_interface_params *params = args;
+    struct unix_device *device = params->device;
+    int ret;
+
+    if (!params->claim)
+    {
+        if ((ret = libusb_release_interface(device->handle, params->interface_number)) < 0
+                && ret != LIBUSB_ERROR_NOT_FOUND)
+            WARN("Failed to release interface %u: %s\n",
+                    params->interface_number, libusb_strerror(ret));
+        return STATUS_SUCCESS;
+    }
+
+    if ((ret = libusb_set_auto_detach_kernel_driver(device->handle, 1)) < 0
+            && ret != LIBUSB_ERROR_NOT_SUPPORTED)
+        WARN("Failed to enable kernel driver auto-detach: %s\n", libusb_strerror(ret));
+
+    if ((ret = libusb_claim_interface(device->handle, params->interface_number)) < 0)
+    {
+        WARN("Failed to claim interface %u: %s\n",
+                params->interface_number, libusb_strerror(ret));
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    TRACE("Claimed interface %u.\n", params->interface_number);
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
 #define X(name) [unix_ ## name] = name
@@ -651,4 +767,6 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     X(usb_submit_urb),
     X(usb_cancel_transfer),
     X(usb_destroy_device),
+    X(usb_get_descriptor),
+    X(usb_claim_interface),
 };

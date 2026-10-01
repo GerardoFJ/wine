@@ -42,6 +42,10 @@ struct usb_event
         struct usb_add_device_event
         {
             struct unix_device *device;
+            /* For an interface pseudo-device, the device it belongs to.
+             * Windows parents interface devnodes on the composite device, and
+             * libusb needs that to attach each interface's path to it. */
+            struct unix_device *parent;
             UINT16 vendor, product, revision, usbver;
             UINT8 class, subclass, protocol, busnum, portnum;
             bool interface;
@@ -74,6 +78,24 @@ struct usb_destroy_device_params
     struct unix_device *device;
 };
 
+struct usb_claim_interface_params
+{
+    struct unix_device *device;
+    UINT8 interface_number;
+    BOOL claim;                 /* FALSE to release */
+};
+
+struct usb_get_descriptor_params
+{
+    struct unix_device *device;
+    UINT8 type;
+    UINT8 index;
+    UINT16 langid;
+    void *buffer;
+    UINT32 size;
+    UINT32 *ret_size;
+};
+
 enum unix_funcs
 {
     unix_usb_main_loop,
@@ -82,6 +104,8 @@ enum unix_funcs
     unix_usb_submit_urb,
     unix_usb_cancel_transfer,
     unix_usb_destroy_device,
+    unix_usb_get_descriptor,
+    unix_usb_claim_interface,
 };
 
 #endif

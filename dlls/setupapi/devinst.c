@@ -3132,6 +3132,61 @@ BOOL WINAPI SetupDiGetDeviceRegistryPropertyA(HDEVINFO devinfo,
         return FALSE;
     }
 
+    if (Property == SPDRP_ADDRESS)
+    {
+        /* USB port number. wineusb.sys encodes it as the last field of the
+         * instance id ("usbver&revision&busnum&portnum"), and the root hub
+         * reports the same value, so both agree.
+         *
+         * Zero must be reported as zero. A root hub occupies no port, and
+         * libusb only recognises a hub as a root hub -- and only then gives
+         * it a bus number -- when it has no listed ancestor *and* no port
+         * number. Our synthetic hub's instance id is "0&ROOTHUB&0", so
+         * clamping the parsed 0 up to 1 made libusb treat it as an ordinary
+         * downstream hub, leaving every device below it without a bus number
+         * and failing the whole enumeration. */
+        DWORD address = 0;
+        const WCHAR *inst;
+
+        if (device->instanceId && (inst = wcsrchr(device->instanceId, '\\')))
+        {
+            const WCHAR *amp = wcsrchr(inst, '&');
+            if (amp && amp[1])
+                address = wcstoul(amp + 1, NULL, 10);
+        }
+
+        if (RequiredSize)
+            *RequiredSize = sizeof(address);
+        if (PropertyRegDataType)
+            *PropertyRegDataType = REG_DWORD;
+        if (PropertyBufferSize < sizeof(address))
+        {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        memcpy(PropertyBuffer, &address, sizeof(address));
+        return TRUE;
+    }
+
+    if (Property == SPDRP_INSTALL_STATE)
+    {
+        /* Wine does not track install state separately; a device present in
+         * the device info set has been enumerated, so report it installed. */
+        DWORD state = 0; /* CM_INSTALL_STATE_INSTALLED */
+
+        if (RequiredSize)
+            *RequiredSize = sizeof(state);
+        if (PropertyRegDataType)
+            *PropertyRegDataType = REG_DWORD;
+        if (PropertyBufferSize < sizeof(state))
+        {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        memcpy(PropertyBuffer, &state, sizeof(state));
+        return TRUE;
+    }
+
     if (Property == SPDRP_ENUMERATOR_NAME)
     {
         const WCHAR *backslash;

@@ -2070,12 +2070,89 @@ CONFIGRET WINAPI CM_Get_DevNode_Property_Keys( DEVINST node, DEVPROPKEY *keys, U
     return CM_Get_DevNode_Property_Keys_Ex( node, keys, count, flags, NULL );
 }
 
+
+/* Wine does not keep an explicit child list, but every devnode records its
+ * parent (DEVPKEY_Device_Parent). Walk the Enum tree and collect the devnodes
+ * whose parent matches, so CM_Get_Child/CM_Get_Sibling can be answered. */
+static CONFIGRET enum_children( DEVINST node, DEVINST *children, unsigned int max,
+                                unsigned int *count )
+{
+    WCHAR enum_name[MAX_DEVICE_ID_LEN], dev_name[MAX_DEVICE_ID_LEN];
+    WCHAR inst_name[MAX_DEVICE_ID_LEN], id[MAX_DEVICE_ID_LEN * 3];
+    HKEY enum_key, ekey, dkey;
+    DWORD i, j, k, size;
+
+    *count = 0;
+
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE,
+            L"System\\CurrentControlSet\\Enum", 0, KEY_ENUMERATE_SUB_KEYS, &enum_key ))
+        return CR_FAILURE;
+
+    for (i = 0; *count < max; i++)
+    {
+        size = ARRAY_SIZE(enum_name);
+        if (RegEnumKeyExW( enum_key, i, enum_name, &size, NULL, NULL, NULL, NULL ))
+            break;
+        if (RegOpenKeyExW( enum_key, enum_name, 0, KEY_ENUMERATE_SUB_KEYS, &ekey ))
+            continue;
+
+        for (j = 0; *count < max; j++)
+        {
+            size = ARRAY_SIZE(dev_name);
+            if (RegEnumKeyExW( ekey, j, dev_name, &size, NULL, NULL, NULL, NULL ))
+                break;
+            if (RegOpenKeyExW( ekey, dev_name, 0, KEY_ENUMERATE_SUB_KEYS, &dkey ))
+                continue;
+
+            for (k = 0; *count < max; k++)
+            {
+                DEVINST child, parent;
+
+                size = ARRAY_SIZE(inst_name);
+                if (RegEnumKeyExW( dkey, k, inst_name, &size, NULL, NULL, NULL, NULL ))
+                    break;
+
+                swprintf( id, ARRAY_SIZE(id), L"%s\\%s\\%s", enum_name, dev_name, inst_name );
+                if (CM_Locate_DevNodeW( &child, id, 0 ))
+                    continue;
+                if (CM_Get_Parent( &parent, child, 0 ))
+                    continue;
+                if (parent != node)
+                    continue;
+
+                children[(*count)++] = child;
+            }
+            RegCloseKey( dkey );
+        }
+        RegCloseKey( ekey );
+    }
+
+    RegCloseKey( enum_key );
+    return CR_SUCCESS;
+}
+
+#define CM_MAX_CHILDREN 256
+
 /***********************************************************************
  *             CM_Get_Child_Ex  (cfgmgr32.@)
  */
 CONFIGRET WINAPI CM_Get_Child_Ex( DEVINST *child, DEVINST node, ULONG flags, HMACHINE machine )
 {
-    FIXME( "child %p, node %#lx, flags %#lx, machine %p stub!\n", child, node, flags, machine );
+    DEVINST children[CM_MAX_CHILDREN];
+    unsigned int count;
+    CONFIGRET cr;
+
+    TRACE( "child %p, node %#lx, flags %#lx, machine %p\n", child, node, flags, machine );
+    if (machine) FIXME( "machine %p not implemented!\n", machine );
+
+    if (!child) return CR_INVALID_POINTER;
+    *child = 0;
+
+    if ((cr = enum_children( node, children, CM_MAX_CHILDREN, &count )))
+        return cr;
+    if (!count) return CR_NO_SUCH_DEVNODE;
+
+    *child = children[0];
     return CR_SUCCESS;
 }
 
@@ -2128,8 +2205,29 @@ CONFIGRET WINAPI CM_Get_DevNode_Status( ULONG *status, ULONG *problem, DEVINST n
  */
 CONFIGRET WINAPI CM_Get_Sibling_Ex( DEVINST *sibling, DEVINST node, ULONG flags, HMACHINE machine )
 {
-    FIXME( "sibling %p, node %#lx, flags %#lx, machine %p stub!\n", sibling, node, flags, machine );
-    return CR_FAILURE;
+    DEVINST children[CM_MAX_CHILDREN], parent;
+    unsigned int count, i;
+    CONFIGRET cr;
+
+    TRACE( "sibling %p, node %#lx, flags %#lx, machine %p\n", sibling, node, flags, machine );
+    if (machine) FIXME( "machine %p not implemented!\n", machine );
+
+    if (!sibling) return CR_INVALID_POINTER;
+    *sibling = 0;
+
+    if ((cr = CM_Get_Parent( &parent, node, 0 )))
+        return cr;
+    if ((cr = enum_children( parent, children, CM_MAX_CHILDREN, &count )))
+        return cr;
+
+    for (i = 0; i < count; i++)
+    {
+        if (children[i] != node) continue;
+        if (i + 1 >= count) return CR_NO_SUCH_DEVNODE;
+        *sibling = children[i + 1];
+        return CR_SUCCESS;
+    }
+    return CR_NO_SUCH_DEVNODE;
 }
 
 /***********************************************************************
