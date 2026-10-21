@@ -105,6 +105,30 @@ static bool get_event(struct usb_event *event)
     return true;
 }
 
+/* WINEUSB_VIDS, if set, is a list of hex vendor IDs (e.g. "3181" or
+ * "3181,0424"); devices from any other vendor are not exposed or opened.
+ * The emulated root hub tells devices apart only by their port number, so an
+ * unrelated device that shares a port number with a wanted one can shadow it. */
+static bool vendor_wanted(uint16_t vendor)
+{
+    const char *p = getenv("WINEUSB_VIDS");
+    char *end;
+
+    if (!p || !*p) return true;
+
+    while (*p)
+    {
+        unsigned long vid = strtoul(p, &end, 16);
+
+        if (end == p)
+            ++end;
+        else if (vid == vendor)
+            return true;
+        p = end;
+    }
+    return false;
+}
+
 static void add_usb_device(libusb_device *libusb_device)
 {
     struct libusb_config_descriptor *config_desc;
@@ -114,6 +138,13 @@ static void add_usb_device(libusb_device *libusb_device)
     int ret;
 
     libusb_get_device_descriptor(libusb_device, &device_desc);
+
+    if (!vendor_wanted(device_desc.idVendor))
+    {
+        TRACE("Ignoring device %p, vendor %04x not in WINEUSB_VIDS.\n", libusb_device,
+                device_desc.idVendor);
+        return;
+    }
 
     TRACE("Adding new device %p, vendor %04x, product %04x.\n", libusb_device,
             device_desc.idVendor, device_desc.idProduct);
